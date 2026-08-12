@@ -18,6 +18,8 @@ switch (first)
         return CmdList(args);
     case "repack":
         return CmdRepack(args);
+    case "dumpgtoc":
+        return CmdDumpGtoc(args);
     case "testcrilayla":
         return CmdTestCrilayla();
     case "--help":
@@ -94,7 +96,15 @@ static int HandleDragDrop(string[] paths)
                 Console.WriteLine($"Packing: {path}");
                 Console.WriteLine($"  -> {outPath}");
 
-                var builder = new CpkBuilder { Alignment = 0x800 };
+                // 拖动文件夹打包：应用 pad3ds 预设（Mode=3 + 智龙迷城 Tvers）并启用压缩
+                // GTOC 由 GenerateGtoc 独立生成（动态按顶层文件夹分组），不从原版 CPK 复制
+                var builder = new CpkBuilder
+                {
+                    Alignment = 0x800,
+                    Compress = true,
+                };
+                CpkBuilder.ApplyPreset(builder, "pad3ds");
+
                 builder.AddDirectory(path);
                 builder.Build(outPath, (msg, current, total) =>
                 {
@@ -392,6 +402,105 @@ static int CmdRepack(string[] args)
     catch (Exception ex)
     {
         Console.Error.WriteLine($"Error: {ex.Message}");
+        return 1;
+    }
+}
+
+static int CmdDumpGtoc(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("Usage: CpkTool dumpgtoc <input.cpk>");
+        return 1;
+    }
+
+    try
+    {
+        using var arc = CpkArchive.Open(args[1]);
+        Console.WriteLine($"GtocOffset: 0x{arc.GtocOffset:X}, GtocSize: {arc.GtocSize}");
+        byte[]? gtocData = arc.ReadGtoc();
+        if (gtocData == null)
+        {
+            Console.Error.WriteLine("No GTOC found");
+            return 1;
+        }
+        Console.WriteLine($"GTOC total bytes: {gtocData.Length}");
+
+        byte[] gtocUtf = gtocData[16..];
+        var gtocTable = UtfTable.Parse(gtocUtf);
+        Console.WriteLine($"\n=== GTOC Table: {gtocTable.Name} ===");
+        Console.WriteLine($"Columns: {gtocTable.Columns.Count}");
+        foreach (var col in gtocTable.Columns)
+            Console.WriteLine($"  {col.Name} ({col.Type}, {col.Storage})");
+        Console.WriteLine($"Rows: {gtocTable.Rows.Count}");
+        foreach (var row in gtocTable.Rows)
+        {
+            foreach (var col in gtocTable.Columns)
+            {
+                var val = row[col.Name];
+                if (val is byte[] bytes)
+                    Console.WriteLine($"  {col.Name}: byte[{bytes.Length}]");
+                else
+                    Console.WriteLine($"  {col.Name}: {val}");
+            }
+        }
+
+        var row0 = gtocTable.Rows[0];
+        void DumpSub(string name)
+        {
+            if (!row0.TryGetValue(name, out var val) || val is not byte[] bytes) return;
+            Console.WriteLine($"\n=== Sub-table: {name} ({bytes.Length} bytes) ===");
+            var table = UtfTable.Parse(bytes);
+            Console.WriteLine($"Table name: {table.Name}, Columns: {table.Columns.Count}, Rows: {table.Rows.Count}");
+            foreach (var col in table.Columns)
+                Console.WriteLine($"  {col.Name} ({col.Type}, {col.Storage})");
+            for (int i = 0; i < Math.Min(table.Rows.Count, 30); i++)
+            {
+                Console.Write($"  Row {i}: ");
+                foreach (var col in table.Columns)
+                {
+                    var v = table.Rows[i][col.Name];
+                    Console.Write($"{col.Name}={(v is byte[] ? "[" + ((byte[])v).Length + "B]" : v)} ");
+                }
+                Console.WriteLine();
+            }
+            if (table.Rows.Count > 30)
+                Console.WriteLine($"  ... ({table.Rows.Count - 30} more rows)");
+
+            // Dump raw row bytes for Flink table
+            if (name == "Fdata")
+            {
+                // Parse UTF header to find row data offset
+                if (bytes.Length >= 32 && bytes[0..4].SequenceEqual(System.Text.Encoding.ASCII.GetBytes("@UTF")))
+                {
+                    uint rowsOffset = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(bytes[8..]);
+                    ushort rowLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(bytes[26..]);
+                    ushort numColumns = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(bytes[24..]);
+                    Console.WriteLine($"  === UTF header: numColumns={numColumns}, rowLength={rowLength}, rowsOffset={rowsOffset} ===");
+
+                    // Dump specific boundary rows (group transitions)
+                    int[] boundaries = { 0, 1, 2717, 2718, 2719, 2720, 2721, 2722, 2723, 2739, 2740, 2741, 2848, 2849, 2850, 2876, 2877, 2878, 2879, 2880, 2883, 2884, 2885, 2928, 2929 };
+                    Console.WriteLine($"  === Boundary rows (group transitions) ===");
+                    foreach (int i in boundaries)
+                    {
+                        if (i >= table.Rows.Count) continue;
+                        var r = table.Rows[i];
+                        Console.WriteLine($"  Row {i}: Aindex={r["Aindex"]} Next={r["Next"]} Child={r["Child"]} SortFlink={r["SortFlink"]}");
+                    }
+                }
+            }
+        }
+
+        DumpSub("Gdata");
+        DumpSub("Fdata");
+        DumpSub("AttrData");
+        DumpSub("GinfData");
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Error: {ex.Message}");
+        Console.Error.WriteLine(ex.StackTrace);
         return 1;
     }
 }

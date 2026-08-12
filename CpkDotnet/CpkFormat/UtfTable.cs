@@ -159,6 +159,7 @@ public sealed class UtfTable
             var row = new Dictionary<string, object?>();
             foreach (var col in table.Columns)
             {
+                // PerRow 列不从行数据读取（值已在列定义的 ConstantValue 中）
                 if (col.Storage == CriStorageFlag.Data)
                 {
                     row[col.Name] = ReadValue(rowData[rp..], col.Type, stringTable, binaryData);
@@ -206,7 +207,9 @@ public sealed class UtfTable
             }
         }
 
-        if (Name == "CpkTocInfo" || Name == "CpkEtocInfo")
+        if (Name == "CpkTocInfo" || Name == "CpkEtocInfo" ||
+            Name == "CpkGtocGlink" || Name == "CpkGtocAttr" ||
+            Name == "CpkGtocInfo" || Name == "CpkGtocFlink")
             AddString("");
 
         foreach (var row in Rows)
@@ -230,6 +233,7 @@ public sealed class UtfTable
 
             if (col.Storage == CriStorageFlag.PerRow)
             {
+                // PerRow 值仅写入列定义，不占用行数据空间（rowLength 不含 PerRow 列）
                 WriteValue(columnBuf, col.ConstantValue ?? UtfColumn.DefaultValueFor(col.Type), col.Type, stringTable, stringOffsets, dataTable);
             }
             else if (col.Storage == CriStorageFlag.Data)
@@ -243,6 +247,7 @@ public sealed class UtfTable
         {
             foreach (var col in Columns)
             {
+                // PerRow 列不写入行数据（值已在列定义中）
                 if (col.Storage == CriStorageFlag.Data)
                 {
                     object? v = row.TryGetValue(col.Name, out var val) ? val : col.ConstantValue;

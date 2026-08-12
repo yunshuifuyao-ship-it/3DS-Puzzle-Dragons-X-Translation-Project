@@ -11,7 +11,7 @@ namespace CpkFormat;
 
 public sealed class CpkBuilder
 {
-    public int Mode { get; set; } = 1;
+    public int Mode { get; set; } = 3;
     public int Alignment { get; set; } = 0x800;
     public bool Compress { get; set; }
     public string Tvers { get; set; } = "CPKMC2.47.02, DLL3.17.00";
@@ -87,6 +87,33 @@ public sealed class CpkBuilder
         Files.Add((archivePath, data, isRaw));
     }
 
+    // 解压目录中常见的非游戏文件扩展名（解压副作用产物）
+    private static readonly HashSet<string> ExcludedExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".orig", // 备份文件
+        ".png",  // timg 解压副作用（原版 CPK 不含 .png）
+    };
+
+    // 原版不压缩的扩展名（已是压缩格式，CRILAYLA 压不进反而极慢）
+    // 注：原版 .awb/.acb 文件大小=压缩大小，证明未压缩
+    private static readonly HashSet<string> UncompressedExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".awb", // CRI 音频流（已压缩）
+        ".acb", // CRI 音频 cue 表（已压缩）
+    };
+
+    // 大文件阈值：>= 4MB 不压缩（双保险，避免极端情况卡顿）
+    // 原版最大压缩文件是 2.19MB 的 mpb_860_conan.tast，4MB 阈值保留所有原版压缩行为
+    private const long LargeFileThreshold = 4 * 1024 * 1024;
+
+    private bool ShouldCompress(string arcPath, long dataLength)
+    {
+        if (!Compress || dataLength < 256) return false;
+        if (dataLength >= LargeFileThreshold) return false;
+        string ext = Path.GetExtension(arcPath);
+        return !UncompressedExtensions.Contains(ext);
+    }
+
     public void AddDirectory(string dirPath)
     {
         dirPath = Path.GetFullPath(dirPath);
@@ -94,6 +121,10 @@ public sealed class CpkBuilder
         foreach (string filePath in Directory.EnumerateFiles(
             dirPath, "*", SearchOption.AllDirectories))
         {
+            string ext = Path.GetExtension(filePath);
+            if (ExcludedExtensions.Contains(ext))
+                continue;
+
             string relPath = Path.GetRelativePath(dirPath, filePath)
                 .Replace('\\', '/');
             byte[] data = File.ReadAllBytes(filePath);
@@ -108,11 +139,6 @@ public sealed class CpkBuilder
 
         int align = Alignment;
         int numFiles = Files.Count;
-
-        if (Mode == 3 && GtocData == null)
-        {
-            GtocData = GenerateGtoc(numFiles);
-        }
 
         var pending = Files.OrderBy(f => CriSortKey(f.Path)).ToList();
 
@@ -154,7 +180,7 @@ public sealed class CpkBuilder
                     extractSize = data.Length;
                 }
             }
-            else if (Compress && data.Length >= 256)
+            else if (ShouldCompress(arcPath, data.Length))
             {
                 byte[] compressed = Crilayla.Compress(data);
                 if (compressed.Length < data.Length)
@@ -218,6 +244,16 @@ public sealed class CpkBuilder
             });
         }
 
+        // 生成 GTOC（需要排序后的文件路径和 ID 来构建分组链表）
+        if (Mode == 3 && GtocData == null)
+        {
+            var sortedPaths = pending.Select(f => f.Path).ToList();
+            var sortedIds = new List<long>(pending.Count);
+            for (int i = 0; i < pending.Count; i++)
+                sortedIds.Add(FileIds != null && i < FileIds.Count ? FileIds[i] : (long)(i + 1));
+            GtocData = GenerateGtoc(numFiles, sortedPaths, sortedIds);
+        }
+
         byte[] tocUtf = tocTable.Build();
         long tocChunkSize = 16 + tocUtf.Length;
         if (tocChunkSize % align != 0)
@@ -247,48 +283,6 @@ public sealed class CpkBuilder
         }
 
         tocUtf = tocTable.Build();
-        tocChunkSize = 16 + tocUtf.Length;
-        if (tocChunkSize % align != 0)
-            tocChunkSize += align - (tocChunkSize % align);
-
-        gtocOffset = GtocData != null ? 0x800 + tocChunkSize : 0;
-        if (GtocData != null)
-        {
-            contentOffset = 0x800 + tocChunkSize + GtocData.Length;
-            if (contentOffset % align != 0)
-                contentOffset += align - (contentOffset % align);
-        }
-        else
-        {
-            contentOffset = 0x800 + tocChunkSize;
-        }
-
-        fileDataOffset = contentOffset - 0x800;
-        for (int i = 0; i < fileInfos.Length; i++)
-        {
-            tocTable.Rows[i]["FileOffset"] = (ulong)fileDataOffset;
-            long padded = fileInfos[i].FileSize;
-            if (padded % align != 0)
-                padded += align - (padded % align);
-            fileDataOffset += padded;
-        }
-
-        tocUtf = tocTable.Build();
-        tocChunkSize = 16 + tocUtf.Length;
-        if (tocChunkSize % align != 0)
-            tocChunkSize += align - (tocChunkSize % align);
-
-        gtocOffset = GtocData != null ? 0x800 + tocChunkSize : 0;
-        if (GtocData != null)
-        {
-            contentOffset = 0x800 + tocChunkSize + GtocData.Length;
-            if (contentOffset % align != 0)
-                contentOffset += align - (contentOffset % align);
-        }
-        else
-        {
-            contentOffset = 0x800 + tocChunkSize;
-        }
 
         long contentSize = 0;
         foreach (var fi in fileInfos)
@@ -343,7 +337,7 @@ public sealed class CpkBuilder
             new("ItocCrc",           CriTypeId.UInt,   CriStorageFlag.Constant,  0U),
             new("GtocOffset",        CriTypeId.ULLong, CriStorageFlag.Data,     0UL),
             new("GtocSize",          CriTypeId.ULLong, CriStorageFlag.Data,     0UL),
-            new("GtocCrc",           CriTypeId.UInt,   CriStorageFlag.Data,     0U),
+            new("GtocCrc",           CriTypeId.UInt,   CriStorageFlag.Constant, 0U),
             new("EnabledPackedSize", CriTypeId.ULLong, CriStorageFlag.Data,     0UL),
             new("EnabledDataSize",   CriTypeId.ULLong, CriStorageFlag.Data,     0UL),
             new("TotalDataSize",     CriTypeId.ULLong, CriStorageFlag.Constant,  0UL),
@@ -453,10 +447,55 @@ public sealed class CpkBuilder
         progress?.Invoke("Done", numFiles, numFiles);
     }
 
-    public byte[] GenerateGtoc(int numFiles)
+    public byte[] GenerateGtoc(int numFiles, List<string> sortedPaths, List<long> sortedIds)
     {
-        int totalFlinkRows = numFiles + 8;
+        // 1. 动态收集 group：第 0 个固定为 "(none)"，其余按顶层文件夹名字母排序
+        //    （原版无 GinfData 子表，游戏走线性扫描路径，group name 不被使用，
+        //     但仍按顶层文件夹分组以保持结构合理性）
+        var groupSet = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        groupSet.Add("(none)");
+        for (int i = 0; i < numFiles; i++)
+        {
+            int slash = sortedPaths[i].IndexOf('/');
+            string topFolder = slash >= 0 ? sortedPaths[i][..slash] : "";
+            if (!string.IsNullOrEmpty(topFolder))
+                groupSet.Add(topFolder);
+        }
+        string[] groupNames = groupSet.ToArray();
+        // groupNames[0] = "(none)", 其余按字母序
 
+        // 2. 将文件分配到各组（保持排序顺序，i 即为 TOC 行索引）
+        var groups = new List<int>[groupNames.Length];
+        for (int i = 0; i < groupNames.Length; i++)
+            groups[i] = new List<int>();
+        var groupIndexMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < groupNames.Length; i++)
+            groupIndexMap[groupNames[i]] = i;
+
+        for (int i = 0; i < numFiles; i++)
+        {
+            int slash = sortedPaths[i].IndexOf('/');
+            string topFolder = slash >= 0 ? sortedPaths[i][..slash] : "(none)";
+            if (string.IsNullOrEmpty(topFolder)) topFolder = "(none)";
+            int gi = groupIndexMap[topFolder];
+            groups[gi].Add(i); // i = TOC 行索引
+        }
+
+        // 3. 计算 Flink 表中各组 header 行和文件行的索引
+        //    布局：组0 header + 组0 files | 组1 header + 组1 files | ...
+        var groupHeaderRows = new int[groupNames.Length];
+        var groupFileRowLists = new List<int>[groupNames.Length];
+        int flinkCursor = 0;
+        for (int gi = 0; gi < groupNames.Length; gi++)
+        {
+            groupHeaderRows[gi] = flinkCursor++;
+            groupFileRowLists[gi] = new List<int>();
+            for (int fi = 0; fi < groups[gi].Count; fi++)
+                groupFileRowLists[gi].Add(flinkCursor++);
+        }
+        int totalFlinkRows = flinkCursor;
+
+        // 4. 构建 Glink 表（groupNames.Length + 1 行：Row 0 根节点 + 各 group）
         var glinkTable = new UtfTable { Name = "CpkGtocGlink" };
         glinkTable.Columns = new List<UtfColumn>
         {
@@ -464,20 +503,28 @@ public sealed class CpkBuilder
             new("Next", CriTypeId.Int, CriStorageFlag.Data, 0),
             new("Child", CriTypeId.Int, CriStorageFlag.Data, 0),
         };
+        // Row 0: 空根节点
         glinkTable.Rows.Add(new Dictionary<string, object?>
         {
             ["Gname"] = "",
             ["Next"] = 0,
             ["Child"] = -1,
         });
-        glinkTable.Rows.Add(new Dictionary<string, object?>
+        // Rows 1..N: group，Next 形成链表 1→2→...→N→0
+        for (int gi = 0; gi < groupNames.Length; gi++)
         {
-            ["Gname"] = "(none)",
-            ["Next"] = 0,
-            ["Child"] = 0,
-        });
+            int glinkRow = gi + 1;
+            int nextGlink = (gi < groupNames.Length - 1) ? (glinkRow + 1) : 0;
+            glinkTable.Rows.Add(new Dictionary<string, object?>
+            {
+                ["Gname"] = groupNames[gi],
+                ["Next"] = nextGlink,
+                ["Child"] = groupHeaderRows[gi], // 指向 Flink header 行
+            });
+        }
         byte[] gdata = glinkTable.Build();
 
+        // 5. 构建 Flink 表（结构不变，Child 用 TOC 行索引）
         var flinkTable = new UtfTable { Name = "CpkGtocFlink" };
         flinkTable.Columns = new List<UtfColumn>
         {
@@ -486,33 +533,45 @@ public sealed class CpkBuilder
             new("Child", CriTypeId.Int, CriStorageFlag.Data, 0),
             new("SortFlink", CriTypeId.Int, CriStorageFlag.Data, 0),
         };
-        flinkTable.Rows.Add(new Dictionary<string, object?>
+        for (int gi = 0; gi < groupNames.Length; gi++)
         {
-            ["Next"] = -1,
-            ["Child"] = -1,
-            ["SortFlink"] = totalFlinkRows - 1,
-        });
-        for (int i = 1; i <= numFiles; i++)
-        {
-            int next = (i == numFiles) ? -1 : i + 1;
+            int headerRow = groupHeaderRows[gi];
+            var fileRows = groupFileRowLists[gi];
+            int fileCount = fileRows.Count;
+            int glinkRow = gi + 1;
+
+            // Header 行：Next=-(Glink行索引)，Child=-(首个文件行索引)，SortFlink=文件数
+            int firstFileRow = fileCount > 0 ? fileRows[0] : headerRow;
             flinkTable.Rows.Add(new Dictionary<string, object?>
             {
-                ["Next"] = next,
-                ["Child"] = -1,
-                ["SortFlink"] = i + 1,
+                ["Next"] = -glinkRow,
+                ["Child"] = -firstFileRow,
+                ["SortFlink"] = fileCount,
             });
-        }
-        for (int i = numFiles + 1; i < totalFlinkRows; i++)
-        {
-            flinkTable.Rows.Add(new Dictionary<string, object?>
+
+            // 文件行：Next=下个文件行(正) 或 -(header行)回链(最后)，Child=TOC行索引
+            // 注：原版 Flink 的 Child 字段是文件在 TOC 表中的行索引（按字母排序后的位置），
+            // 游戏通过 |Child| 作为 TOC 行索引读取文件信息，不是文件 ID。
+            // SortFlink 简化为与 Next 相同：原版无 GinfData 子表，游戏走线性扫描路径，
+            // 不进入 sub_50382C 二分查找，SortFlink 字段不被读取。
+            for (int fi = 0; fi < fileRows.Count; fi++)
             {
-                ["Next"] = -1,
-                ["Child"] = -1,
-                ["SortFlink"] = -1,
-            });
+                int nextRow = (fi < fileRows.Count - 1)
+                    ? fileRows[fi + 1]
+                    : -headerRow;
+                int tocRowIndex = groups[gi][fi]; // TOC 行索引
+
+                flinkTable.Rows.Add(new Dictionary<string, object?>
+                {
+                    ["Next"] = nextRow,
+                    ["Child"] = tocRowIndex,
+                    ["SortFlink"] = nextRow,
+                });
+            }
         }
         byte[] fdata = flinkTable.Build();
 
+        // 6. 构建 AttrData 表（1 行，与原版一致）
         var attrTable = new UtfTable { Name = "CpkGtocAttr" };
         attrTable.Columns = new List<UtfColumn>
         {
@@ -530,6 +589,7 @@ public sealed class CpkBuilder
         });
         byte[] attrData = attrTable.Build();
 
+        // 7. 构建 GTOC 包装表
         var gtocTable = new UtfTable { Name = "CpkGtocInfo" };
         gtocTable.Columns = new List<UtfColumn>
         {
@@ -542,7 +602,7 @@ public sealed class CpkBuilder
         };
         gtocTable.Rows.Add(new Dictionary<string, object?>
         {
-            ["Glink"] = 2U,
+            ["Glink"] = (uint)(groupNames.Length + 1), // 含根节点
             ["Flink"] = (uint)totalFlinkRows,
             ["Attr"] = 1U,
             ["Gdata"] = gdata,
@@ -551,6 +611,7 @@ public sealed class CpkBuilder
         });
         byte[] gtocUtf = gtocTable.Build();
 
+        // 8. 包装为 GTOC chunk（含 16 字节头）
         int chunkSize = 16 + gtocUtf.Length;
         byte[] gtocChunk = new byte[chunkSize];
         gtocChunk[0] = (byte)'G';
